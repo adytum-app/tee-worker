@@ -42,6 +42,9 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy the nsjail configuration file
+COPY nsjail.cfg /app/nsjail.cfg
+
 # Copy application code from the src directory
 COPY src/ ./src/
 
