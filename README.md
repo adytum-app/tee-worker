@@ -375,4 +375,4 @@ def run(input_data):
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+BSL License - see [LICENSE](LICENSE) for details.
