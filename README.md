@@ -16,7 +16,7 @@ A Python-based TEE (Trusted Execution Environment) worker that runs inside a dst
 
 This worker implements the TEE-resident agent from:
 
-> **"NDAI: Enforcing Non-Disclosure Agreements with AI Agents"** by Matt Stephenson, Andrew Miller, Xyn Sun, Bhargav Annem, and Rohan Parikh  
+> **"NDAI Agreements"** by Matt Stephenson, Andrew Miller, Xyn Sun, Bhargav Annem, and Rohan Parikh  
 > arXiv:2502.07924v1 [econ.TH] — February 2025
 
 The NDAI paper proves that TEEs combined with AI agents can function as an "ironclad NDA" enabling secure disclosure without expropriation risk.
@@ -365,7 +365,7 @@ def run(input_data):
 
 ## References
 
-1. Stephenson, M., Miller, A., Sun, X., Annem, B., & Parikh, R. (2025). _NDAi: Enforcing Non-Disclosure Agreements with AI Agents_. arXiv:2502.07924v1 [econ.TH].
+1. Stephenson, M., Miller, A., Sun, X., Annem, B., & Parikh, R. (2025). _NDAI Agreements_. arXiv:2502.07924v1 [econ.TH].
 
 2. Google nsjail: https://github.com/google/nsjail
 
