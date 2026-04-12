@@ -1,0 +1,109 @@
+# Adytum TEE Worker - Docker Compose Configuration
+# =================================================
+# Deploys to Phala Cloud with On-Chain KMS support.
+#
+# Architecture:
+#   1. identity - Node.js sidecar that derives keys from dstack-sdk (runs once, exits)
+#   2. worker   - Python FastAPI server that handles execution and key release
+#
+# Deploy to Phala Cloud:
+#   phala deploy -c docker-compose.yml --kms base --prepare-only
+#   # Register compose hash via multisig
+#   phala deploy --commit --token <token>
+#
+# Local testing (without dstack):
+#   docker-compose up --build
+#   # Worker will use ORACLE_PRIVATE_KEY env var as fallback
+
+services:
+  # =============================================================================
+  # Identity Sidecar
+  # =============================================================================
+  # Derives deterministic Ethereum keys from the dstack KMS.
+  # Runs once on startup, writes keys to shared volume, then exits.
+  identity:
+    build:
+      context: .
+      dockerfile: identity/Dockerfile
+    volumes:
+      # CRITICAL: Required for dstack-sdk to communicate with KMS
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      # Shared volume for key handoff to worker
+      - tee-storage:/tee
+    environment:
+      - DERIVED_KEYS_PATH=/tee/derived-keys.json
+      - EXECUTION_KEY_PATH=adytum/execution/v1
+      - SETTLEMENT_KEY_PATH=adytum/settlement/v1
+    # Run once and exit (don't restart)
+    restart: "no"
+
+  # =============================================================================
+  # Main TEE Worker
+  # =============================================================================
+  # Python FastAPI server that handles:
+  # - Invention code execution in nsjail sandbox
+  # - Key storage and release for Nash negotiations
+  # - Contract interactions (submitExecutionResult, releaseKey, etc.)
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: adytum-tee-worker:latest
+    # Wait for identity service to complete successfully
+    depends_on:
+      identity:
+        condition: service_completed_successfully
+    volumes:
+      # CRITICAL: Required for dstack-sdk (if worker needs direct access)
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      # Shared volume containing derived keys
+      - tee-storage:/tee
+    environment:
+      # Network configuration
+      - RPC_URL=${RPC_URL:-https://mainnet.base.org}
+      - CONTRACT_ADDRESS=${CONTRACT_ADDRESS}
+
+      # Key loading
+      - DERIVED_KEYS_PATH=/tee/derived-keys.json
+
+      # SECURITY WARNING: Fallback for local testing ONLY.
+      # NEVER populate this variable in production. If compromised, attackers could steal IP.
+      - ORACLE_PRIVATE_KEY=${ORACLE_PRIVATE_KEY:-}
+
+      # Worker configuration
+      - KEY_STORE_PATH=/tee/keys
+      - NSJAIL_CONFIG_PATH=/app/nsjail.cfg
+      - SANDBOX_TIMEOUT_SECONDS=${SANDBOX_TIMEOUT_SECONDS:-30}
+      - SANDBOX_MEMORY_LIMIT_MB=${SANDBOX_MEMORY_LIMIT_MB:-256}
+
+      # CORS (configure for your frontend domain in production)
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
+
+      # Server settings
+      - HOST=0.0.0.0
+      - PORT=8001
+    ports:
+      - "8001:8001"
+    # Restart on failure (but not on stop)
+    restart: unless-stopped
+    # Health check
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import requests; requests.get('http://localhost:8001/health', timeout=5).raise_for_status()",
+        ]
+      interval: 30s
+      timeout: 10s
+      start_period: 10s
+      retries: 3
+
+# =============================================================================
+# Volumes
+# =============================================================================
+# TEE-sealed storage for keys and derived identities
+volumes:
+  tee-storage:
+    driver: local
