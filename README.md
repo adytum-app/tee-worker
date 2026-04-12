@@ -1,8 +1,11 @@
 # Adytum TEE Worker
 
-> _The secure execution environment for protected knowledge_
+Secure execution environment for the Adytum IP Marketplace. Runs inside a Phala Cloud TEE (dstack) enclave,implementing the secure disclosure mechanism from the NDAI paper and provide:
 
-A Python-based TEE (Trusted Execution Environment) worker that runs inside a dstack enclave, implementing the secure disclosure mechanism from the NDAI paper.
+- **Sandboxed Code Execution** — Invention code runs in nsjail with strict isolation
+- **Deterministic Identity** — Keys derived via dstack-sdk for reproducible addresses
+- **Secure Key Management** — Decryption keys stored in TEE-sealed storage
+- **On-Chain Integration** — Submits execution results and releases keys to Nash winners
 
 [![Python](https://img.shields.io/badge/Python-3.11-blue)](https://python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.109-green)](https://fastapi.tiangolo.com/)
@@ -10,159 +13,152 @@ A Python-based TEE (Trusted Execution Environment) worker that runs inside a dst
 [![dstack](https://img.shields.io/badge/TEE-dstack-purple)](https://dstack.dev/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
----
-
-## Theoretical Foundation
-
-This worker implements the TEE-resident agent from:
-
-> **"NDAI Agreements"** by Matt Stephenson, Andrew Miller, Xyn Sun, Bhargav Annem, and Rohan Parikh  
-> arXiv:2502.07924v1 [econ.TH] — February 2025
-
-The NDAI paper proves that TEEs combined with AI agents can function as an "ironclad NDA" enabling secure disclosure without expropriation risk.
-
----
-
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                      TEE ENCLAVE (dstack)                       │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │                    HTTP Server (FastAPI)                │    │
-│  │  /health  /execute  /release-key  /store-key  /keys     │    │
-│  └─────────────────────────┬───────────────────────────────┘    │
-│                            │                                    │
-│  ┌─────────────────────────▼───────────────────────────────┐    │
-│  │                    TEE Worker                           │    │
-│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐   │    │
-│  │  │ Code Fetch   │  │   nsjail     │  │ Key Release  │   │    │
-│  │  │ & Verify     │  │  Sandbox     │  │ (ECIES)      │   │    │
-│  │  └──────────────┘  └──────────────┘  └──────────────┘   │    │
-│  └─────────────────────────────────────────────────────────┘    │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │                    Key Store (Sealed)                   │    │
-│  │              /tee/keys/{invention_id}.key               │    │
-│  └─────────────────────────────────────────────────────────┘    │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-              ┌───────────────────────────────┐
-              │   AdytumMarketplace.sol       │
-              │   (Base Sepolia)              │
-              └───────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                         PHALA CLOUD TEE                             │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │  identity (Node.js)              worker (Python/FastAPI)       ││
+│  │  ┌───────────────────┐           ┌────────────────────────┐    ││
+│  │  │ dstack-sdk        │           │ /execute               │    ││
+│  │  │ getKey('adytum/   │──────────►│ /release-key           │    ││
+│  │  │   execution/v1')  │ keys.json │ /store-key             │    ││
+│  │  │ getKey('adytum/   │           │ /health                │    ││
+│  │  │   settlement/v1') │           └────────────────────────┘    ││
+│  │  └───────────────────┘                     │                   ││
+│  └────────────────────────────────────────────│───────────────────┘│
+│                                               │                    │
+│                         /var/run/dstack.sock  │  port 8001         │
+└─────────────────────────────────────────────────────────────────────┘
+                                                │
+                                                ▼
+                                    ┌───────────────────────────────┐
+                                    │   AdytumMarketplace.sol       │
+                                    │   (Base Sepolia)              │
+                                    └───────────────────────────────┘
+                                    (submitExecutionResult,
+                                     releaseKey, settleNash)
 ```
 
----
+## Quick Start
 
-## Features
+### Local Development (without TEE)
 
-### Code Execution (nsjail Sandbox)
+```bash
+# Clone the repo
+git clone https://github.com/adytum-app/tee-worker.git
+cd tee-worker
 
-- **Namespace isolation** — PID, IPC, UTS, mount, and user namespaces
-- **Resource limits** — CPU time, memory, file descriptors, process count
-- **No network access** — `clone_newnet: true` isolates network stack
-- **Read-only filesystem** — only `/tmp` is writable (64MB tmpfs)
-- **Unprivileged execution** — runs as `nobody` (UID 65534) inside sandbox
-- **Hash verification** — encrypted code hash must match on-chain commitment
-- **Forbidden pattern detection** — defense-in-depth blocks dangerous imports
-- **Cryptographic attestation** — results signed by oracle key
+# Create .env file
+cat > .env << EOF
+RPC_URL=https://sepolia.base.org
+CONTRACT_ADDRESS=0x...  # Your deployed contract
+ORACLE_PRIVATE_KEY=0x...  # Test key (NOT for production!)
+EOF
 
-### Key Management
-
-- **Sealed storage** — keys stored in TEE-protected filesystem
-- **ECIES encryption** — keys encrypted with buyer's secp256k1 public key (ECDH + HKDF + AES-GCM)
-- **Authorization checks** — verifies Nash phase and winner before release
-
-### Contract Integration
-
-- **submitExecutionResult** — posts result hash and attestation
-- **failExecution** — reports execution failures
-- **releaseEncryptedKey** — delivers encrypted key to Nash winner
-- **getInvention / getNashConfig** — reads on-chain state
-
----
-
-## Project Structure
-
-```
-adytum-tee-worker/
-├── Dockerfile           # Container image with nsjail
-├── requirements.txt     # Python dependencies
-├── nsjail.cfg           # Sandbox configuration
-└── src/
-    ├── server.py        # FastAPI HTTP server
-    └── worker.py        # TEE worker logic
+# Build and run
+docker-compose up --build
 ```
 
----
+### Production Deployment (Phala Cloud)
+
+See [TEE.md](./TEE.md) for the complete deployment guide.
+
+```bash
+# 1. Prepare deployment (generates compose hash)
+phala deploy -c docker-compose.yml --kms base --prepare-only
+
+# 2. Register compose hash via multisig (see TEE.md)
+
+# 3. Commit the deployment
+phala deploy --commit --token <token>
+
+# 4. Get TEE addresses from logs, deploy contract, update CVM
+```
+
+## Repository Structure
+
+```
+tee-worker/
+├── identity/              # Node.js identity sidecar
+│   ├── index.js           # Key derivation via dstack-sdk
+│   ├── package.json       # Dependencies (@phala/dstack-sdk, viem)
+│   └── Dockerfile         # Sidecar container
+├── src/
+│   ├── server.py          # FastAPI HTTP endpoints
+│   └── worker.py          # Core TEE logic
+├── docker-compose.yml     # Two-container deployment config
+├── Dockerfile             # Main worker container (Python + nsjail)
+├── nsjail.cfg             # Sandbox configuration
+├── requirements.txt       # Python dependencies
+├── TEE.md                 # Deployment guide
+└── README.md              # This file
+```
 
 ## API Endpoints
 
-### Health & Status
+| Endpoint       | Method | Description                              |
+| -------------- | ------ | ---------------------------------------- |
+| `/health`      | GET    | Health check with oracle address         |
+| `/attestation` | GET    | TEE attestation report                   |
+| `/execute`     | POST   | Execute invention code in sandbox        |
+| `/release-key` | POST   | Release decryption key to Nash winner    |
+| `/store-key`   | POST   | Store decryption key for new invention   |
+| `/keys/{id}`   | GET    | Check if key exists for invention        |
+| `/keys/{id}`   | DELETE | Delete key (when deactivating invention) |
+
+### Example: Execute Invention
 
 ```bash
-# Health check
-GET /health
-→ { status, oracle_address, enclave, contract_address, key_store_path, nsjail_config }
-
-# TEE attestation
-GET /attestation
-→ { enclave_type, oracle_address, attestation, timestamp }
+curl -X POST http://localhost:8001/execute \
+  -H "Content-Type: application/json" \
+  -d '{
+    "execution_id": "0x0000...0001",
+    "invention_id": "0x0000...0001",
+    "buyer": "0x1234...5678",
+    "input_data": {"prompt": "Hello, world!"}
+  }'
 ```
 
-### Execution
+### Example: Health Check
 
 ```bash
-# Execute invention code in nsjail sandbox
-POST /execute
-{
-  "execution_id": "0x...",
-  "invention_id": "0x...",
-  "buyer": "0x...",
-  "input_data": { ... }
-}
-→ { success, output, result_hash, execution_time_ms, attestation }
+curl http://localhost:8001/health
 ```
 
-### Key Management
-
-```bash
-# Store key (seller listing)
-POST /store-key
+```json
 {
-  "invention_id": "0x...",
-  "decryption_key": "...",  # Fernet key (44 chars base64)
-  "seller": "0x..."
+  "status": "healthy",
+  "oracle_address": "0x...",
+  "enclave": "dstack",
+  "contract_address": "0x...",
+  "key_store_path": "/tee/keys",
+  "nsjail_config": "/app/nsjail.cfg"
 }
-→ { success, invention_id }
-
-# Release key (Nash winner)
-POST /release-key
-{
-  "invention_id": "0x...",
-  "buyer": "0x..."
-}
-→ { success, encrypted_key, attestation, tx_hash }
-
-# Check key exists
-GET /keys/{invention_id}
-→ { invention_id, key_exists }
-
-# Delete key (deactivation)
-DELETE /keys/{invention_id}?seller=0x...
-→ { invention_id, deleted }
 ```
 
----
+## Key Derivation Paths
+
+| Purpose    | Path                   | Smart Contract Role   |
+| ---------- | ---------------------- | --------------------- |
+| Execution  | `adytum/execution/v1`  | `TEE_EXECUTION_ROLE`  |
+| Settlement | `adytum/settlement/v1` | `TEE_SETTLEMENT_ROLE` |
+
+Keys are deterministically derived from the dstack KMS root key. The same path always produces the same Ethereum address, making deployments reproducible.
 
 ## Security Model
 
-### nsjail Sandbox Configuration
+### Sandbox Isolation (nsjail)
+
+Invention code executes in a heavily restricted environment:
+
+- **Namespace isolation** — PID, IPC, UTS, mount, user namespaces
+- **Resource limits** — 10s CPU, 256MB memory, 128 file descriptors
+- **No network** — `clone_newnet: true` blocks all network access
+- **Read-only filesystem** — Only `/tmp` is writable (tmpfs, 64MB)
+- **Unprivileged user** — Runs as `nobody` (UID 65534)
+- **Single-threaded ML** — `OMP_NUM_THREADS=1` prevents thread-based attacks
 
 | Protection           | Setting         | Value                         |
 | -------------------- | --------------- | ----------------------------- |
@@ -186,23 +182,14 @@ MKL_NUM_THREADS=1
 NUMEXPR_NUM_THREADS=1
 ```
 
-### Defense-in-Depth: Forbidden Patterns
+### Code Validation (Defense-in-Depth)
 
-Before nsjail execution, code is scanned for dangerous patterns:
+Before sandbox execution, code is scanned for:
 
-```python
-# System access
-"import os", "import sys", "import subprocess", ...
-
-# Network access
-"import socket", "import requests", "import urllib", ...
-
-# Code execution
-"__import__", "eval(", "exec(", "compile(", ...
-
-# Dangerous dunders
-"__class__", "__bases__", "__subclasses__", "__globals__", ...
-```
+- System imports (`os`, `sys`, `subprocess`, ...)
+- Network imports (`socket`, `requests`, `urllib`, ...)
+- Code execution (`eval`, `exec`, `__import__`, ...)
+- Dangerous dunder attributes (`__class__`, `__subclasses__`, ...)
 
 ### Key Release Authorization
 
@@ -212,68 +199,47 @@ Before releasing a key, the worker verifies on-chain:
 2. **Phase check** — Nash must be `NashPhase.SETTLED`
 3. **Winner check** — Buyer must equal `highestBidder` from contract
 
----
+### TEE Key Protection
+
+- Private keys never leave the TEE enclave
+- Keys are derived from dstack KMS (deterministic, reproducible)
+- Invention decryption keys stored in TEE-sealed storage
+- ECIES encryption for key delivery to Nash winners
 
 ## Environment Variables
 
-| Variable                  | Required | Default                    | Description                            |
-| ------------------------- | -------- | -------------------------- | -------------------------------------- |
-| `CONTRACT_ADDRESS`        | Yes      | -                          | AdytumMarketplace contract address     |
-| `ORACLE_PRIVATE_KEY`      | Yes      | -                          | Oracle wallet private key              |
-| `RPC_URL`                 | No       | `https://sepolia.base.org` | Base RPC endpoint                      |
-| `IPFS_GATEWAY`            | No       | `https://ipfs.io/ipfs/`    | IPFS gateway URL                       |
-| `KEY_STORE_PATH`          | No       | `/tee/keys`                | Path for sealed key storage            |
-| `NSJAIL_CONFIG_PATH`      | No       | `/app/nsjail.cfg`          | Path to nsjail configuration           |
-| `HOST`                    | No       | `0.0.0.0`                  | Server bind address                    |
-| `PORT`                    | No       | `8001`                     | Server port                            |
-| `SANDBOX_TIMEOUT_SECONDS` | No       | `30`                       | Execution timeout                      |
-| `SANDBOX_MEMORY_LIMIT_MB` | No       | `256`                      | Memory limit for sandbox               |
-| `CORS_ORIGINS`            | No       | `*`                        | Allowed CORS origins (comma-separated) |
-
----
+| Variable                  | Required | Default                    | Description                 |
+| ------------------------- | -------- | -------------------------- | --------------------------- |
+| `RPC_URL`                 | Yes      | `https://sepolia.base.org` | Ethereum RPC endpoint       |
+| `CONTRACT_ADDRESS`        | Yes      | —                          | AdytumMarketplace contract  |
+| `DERIVED_KEYS_PATH`       | No       | `/tee/derived-keys.json`   | Path to derived keys        |
+| `ORACLE_PRIVATE_KEY`      | No       | —                          | Fallback key (testing only) |
+| `KEY_STORE_PATH`          | No       | `/tee/keys`                | Invention key storage       |
+| `NSJAIL_CONFIG_PATH`      | No       | `/app/nsjail.cfg`          | Sandbox config              |
+| `SANDBOX_TIMEOUT_SECONDS` | No       | `30`                       | Max execution time          |
+| `SANDBOX_MEMORY_LIMIT_MB` | No       | `256`                      | Max memory                  |
+| `CORS_ORIGINS`            | No       | `*`                        | Allowed CORS origins        |
 
 ## Development
 
-### Local Testing
+### Running Tests
 
 ```bash
-cd src/
+# Install dev dependencies
+pip install pytest pytest-asyncio httpx
 
-# Install dependencies
-pip install -r ../requirements.txt
-
-# Set environment
-export CONTRACT_ADDRESS=0x...
-export ORACLE_PRIVATE_KEY=0x...
-export RPC_URL=https://sepolia.base.org
-
-# Run server (without nsjail)
-python server.py
+# Run tests
+pytest tests/
 ```
 
-### Docker (with nsjail)
+### Building Images
 
 ```bash
-# Build
-docker build -t adytum-tee-worker .
+# Build identity sidecar
+docker build -f identity/Dockerfile -t adytum-tee-identity:latest .
 
-# Run (requires capabilities for nsjail)
-docker run --cap-add=SYS_ADMIN --cap-add=SYS_PTRACE -p 8001:8001 \
-  -e CONTRACT_ADDRESS=0x... \
-  -e ORACLE_PRIVATE_KEY=0x... \
-  -e RPC_URL=https://sepolia.base.org \
-  adytum-tee-worker
-```
-
-### dstack Deployment
-
-```bash
-# Deploy to dstack TEE
-dstack deploy \
-  --image adytum-tee-worker \
-  --env CONTRACT_ADDRESS=0x... \
-  --env ORACLE_PRIVATE_KEY=0x... \
-  --port 8001
+# Build main worker
+docker build -t adytum-tee-worker:latest .
 ```
 
 ---
@@ -363,16 +329,13 @@ def run(input_data):
 
 ---
 
-## References
-
-1. Stephenson, M., Miller, A., Sun, X., Annem, B., & Parikh, R. (2025). _NDAI Agreements_. arXiv:2502.07924v1 [econ.TH].
-
-2. Google nsjail: https://github.com/google/nsjail
-
-3. dstack TEE Documentation: https://docs.dstack.dev/
-
----
-
 ## License
 
 BSL License - see [LICENSE](LICENSE) for details.
+
+## References
+
+- [NDAI Paper](https://arxiv.org/abs/...) — Stephenson et al., 2025
+- [Phala Cloud Documentation](https://docs.phala.cloud)
+- [dstack SDK](https://github.com/Phala-Network/dstack)
+- [nsjail](https://github.com/google/nsjail)
