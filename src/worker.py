@@ -10,11 +10,14 @@ Runs inside a dstack TEE enclave. Handles:
 6. Signing results and interacting with AdytumMarketplace.sol
 
 Implements the TEE-resident agent from NDAi paper (Stephenson et al., 2025)
+
+Key Derivation:
+- Production: Keys are derived via dstack-sdk (Node.js identity sidecar)
+- Testing: Falls back to ORACLE_PRIVATE_KEY environment variable
 """
 
 import os
 import json
-import hashlib
 import subprocess
 import tempfile
 import time
@@ -37,10 +40,15 @@ import requests
 
 RPC_URL = os.getenv("RPC_URL", "https://sepolia.base.org")
 CONTRACT_ADDRESS = os.getenv("CONTRACT_ADDRESS")
-ORACLE_PRIVATE_KEY = os.getenv("ORACLE_PRIVATE_KEY")
 IPFS_GATEWAY = os.getenv("IPFS_GATEWAY", "https://ipfs.io/ipfs/")
 KEY_STORE_PATH = os.getenv("KEY_STORE_PATH", "/tee/keys")
 NSJAIL_CONFIG_PATH = os.getenv("NSJAIL_CONFIG_PATH", "/app/nsjail.cfg")
+
+# Key loading configuration
+# Production: Keys derived by identity sidecar and written to this path
+# Testing: Falls back to ORACLE_PRIVATE_KEY environment variable
+DERIVED_KEYS_PATH = os.getenv("DERIVED_KEYS_PATH", "/tee/derived-keys.json")
+ORACLE_PRIVATE_KEY = os.getenv("ORACLE_PRIVATE_KEY")
 
 # Sandbox configuration
 SANDBOX_TIMEOUT_SECONDS = int(os.getenv("SANDBOX_TIMEOUT_SECONDS", "30"))
@@ -49,6 +57,7 @@ SANDBOX_MEMORY_LIMIT_MB = int(os.getenv("SANDBOX_MEMORY_LIMIT_MB", "256"))
 # =============================================================================
 # Contract Constants (must match AdytumMarketplace.sol)
 # =============================================================================
+
 
 class NashPhase:
     """Matches contract enum NashPhase"""
@@ -78,7 +87,7 @@ class ExecutionRequestDomain:
     decryption_key: str  # Only TEE has this
 
 
-@dataclass 
+@dataclass
 class ExecutionResultDomain:
     execution_id: str
     invention_id: str
@@ -123,38 +132,141 @@ class NashConfigData:
 
 
 # =============================================================================
+# Key Loading Helper
+# =============================================================================
+
+def load_derived_keys() -> dict | None:
+    """
+    Load deterministically derived keys from the identity sidecar.
+
+    The identity sidecar (Node.js) runs first via docker-compose depends_on,
+    derives keys using dstack-sdk, and writes them to DERIVED_KEYS_PATH.
+
+    Returns:
+        dict with 'execution' and 'settlement' keys, each containing
+        'address' and 'privateKey', or None if file doesn't exist.
+    """
+    if not os.path.exists(DERIVED_KEYS_PATH):
+        return None
+
+    try:
+        with open(DERIVED_KEYS_PATH, 'r') as f:
+            keys = json.load(f)
+
+        # Validate structure
+        if 'execution' not in keys or 'settlement' not in keys:
+            print(
+                "[Key Loader] Invalid key file structure at "
+                f"{DERIVED_KEYS_PATH}"
+            )
+            return None
+
+        if (
+            'privateKey' not in keys['execution']
+            or 'privateKey' not in keys['settlement']
+        ):
+            print("[Key Loader] Missing privateKey in key file")
+            return None
+
+        return keys
+
+    except json.JSONDecodeError as e:
+        print(f"[Key Loader] Failed to parse key file: {e}")
+        return None
+    except Exception as e:
+        print(f"[Key Loader] Error loading key file: {e}")
+        return None
+
+
+# =============================================================================
 # Main TEE Worker
 # =============================================================================
 
 class AdytumTEEWorker:
     """
     TEE Worker implementing the secure execution environment from NDAi paper.
-    
+
     Provides:
     - Isolated code execution with nsjail sandboxing
     - Cryptographic attestation of results
     - Secure key delivery to Nash winners
+
+    Key Management:
+    - Production: Uses deterministically derived keys from dstack-sdk
+    - Testing: Falls back to ORACLE_PRIVATE_KEY environment variable
     """
-    
+
     def __init__(self):
         self.w3 = Web3(Web3.HTTPProvider(RPC_URL))
-        
-        if not ORACLE_PRIVATE_KEY:
-            # Generate a mock account for testing if none is provided
-            self.account = Account.create()
-            print(f"[TEE Worker] Generated test account: {self.account.address}")
-        else:
+
+        # =================================================================
+        # Load keys: Try dstack-derived keys first, fall back to env var
+        # =================================================================
+        derived_keys = load_derived_keys()
+
+        if derived_keys:
+            # Production mode: Use deterministically derived keys
+            exec_pk = derived_keys["execution"]["privateKey"]
+            settle_pk = derived_keys["settlement"]["privateKey"]
+            self.account = Account.from_key(exec_pk)
+            self.settlement_account = Account.from_key(settle_pk)
+
+            print("[TEE Worker] ✓ Loaded derived keys from dstack-sdk")
+            print(f"[TEE Worker]   Execution:  {self.account.address}")
+            print(
+                f"[TEE Worker]   Settlement: "
+                f"{self.settlement_account.address}"
+            )
+
+            # Verify addresses match what's in the file
+            if derived_keys["execution"].get("address"):
+                file_addr = derived_keys["execution"]["address"]
+                if self.account.address.lower() != file_addr.lower():
+                    print(
+                        "[TEE Worker] ⚠ WARNING: "
+                        "Derived execution address mismatch!"
+                    )
+
+        elif ORACLE_PRIVATE_KEY:
+            # Testing mode: Use environment variable (single key for both
+            # roles)
             self.account = Account.from_key(ORACLE_PRIVATE_KEY)
-            print(f"[TEE Worker] Loaded oracle account: {self.account.address}")
-        
+            self.settlement_account = self.account  # Same account for testing
+
+            print(
+                "[TEE Worker] ⚠ Using ORACLE_PRIVATE_KEY from environment "
+                "(testing mode)"
+            )
+            print(f"[TEE Worker]   Address: {self.account.address}")
+
+        else:
+            # No keys available - generate random (for local dev only)
+            self.account = Account.create()
+            self.settlement_account = Account.create()
+
+            print(
+                "[TEE Worker] ⚠ WARNING: Generated random test accounts "
+                "(no persistence!)"
+            )
+            print(f"[TEE Worker]   Execution:  {self.account.address}")
+            print(
+                f"[TEE Worker]   Settlement: "
+                f"{self.settlement_account.address}"
+            )
+
         # Verify nsjail config exists
         if not os.path.exists(NSJAIL_CONFIG_PATH):
-            print(f"[TEE Worker] WARNING: nsjail config not found at {NSJAIL_CONFIG_PATH}")
+            print(
+                f"[TEE Worker] WARNING: nsjail config not found at "
+                f"{NSJAIL_CONFIG_PATH}"
+            )
         else:
-            print(f"[TEE Worker] nsjail config loaded from {NSJAIL_CONFIG_PATH}")
-            
+            print(
+                f"[TEE Worker] nsjail config loaded from {NSJAIL_CONFIG_PATH}"
+            )
+
         self.contract = self._load_contract()
-        
+
     def _load_contract(self):
         """Load the AdytumMarketplace contract ABI."""
         abi = [
@@ -268,21 +380,21 @@ class AdytumTEEWorker:
                 "stateMutability": "view"
             },
         ]
-        
+
         if not CONTRACT_ADDRESS:
             raise ValueError("CONTRACT_ADDRESS environment variable not set")
-            
+
         return self.w3.eth.contract(address=CONTRACT_ADDRESS, abi=abi)
 
     # =========================================================================
     # Invention Data Fetching
     # =========================================================================
-    
+
     def get_invention(self, invention_id: str) -> InventionData:
         """Fetch invention data from contract."""
         inv_bytes = self._to_bytes32(invention_id)
         inv_data = self.contract.functions.getInvention(inv_bytes).call()
-        
+
         return InventionData(
             id=inv_data[0],
             seller=inv_data[1],
@@ -294,12 +406,12 @@ class AdytumTEEWorker:
             created_at=inv_data[7],
             is_active=inv_data[8],
         )
-    
+
     def get_nash_config(self, invention_id: str) -> NashConfigData:
         """Fetch Nash configuration from contract."""
         inv_bytes = self._to_bytes32(invention_id)
         nash_data = self.contract.functions.getNashConfig(inv_bytes).call()
-        
+
         return NashConfigData(
             seller_bid_hash=nash_data[0],
             seller_min_revealed=nash_data[1],
@@ -318,18 +430,19 @@ class AdytumTEEWorker:
 
     def fetch_invention_code(self, invention_id: str) -> bytes:
         """
-        Fetch encrypted code from IPFS and verify hash matches on-chain commitment.
-        
+        Fetch encrypted code from IPFS and verify hash matches on-chain
+        commitment.
+
         1. Get invention metadata URI from contract
         2. Fetch metadata JSON from IPFS
         3. Fetch encrypted code from encryptedCodeUri
         4. Verify keccak256(encrypted_code) == encryptedCodeHash
         """
         invention = self.get_invention(invention_id)
-        
+
         if not invention.is_active:
             raise ValueError(f"Invention {invention_id} is not active")
-        
+
         metadata_uri = invention.metadata_uri
         expected_hash = invention.encrypted_code_hash
 
@@ -339,13 +452,13 @@ class AdytumTEEWorker:
             url = f"{IPFS_GATEWAY}{cid}"
         else:
             url = metadata_uri
-            
+
         # 2. Fetch metadata JSON
         print(f"[TEE Worker] Fetching metadata from {url}")
         meta_resp = requests.get(url, timeout=10)
         meta_resp.raise_for_status()
         metadata = meta_resp.json()
-        
+
         # 3. Get encrypted code URI
         code_uri = metadata.get("encryptedCodeUri")
         if not code_uri:
@@ -362,7 +475,7 @@ class AdytumTEEWorker:
         code_resp = requests.get(code_url, timeout=30)
         code_resp.raise_for_status()
         encrypted_code = code_resp.content
-        
+
         # 5. CRITICAL: Verify hash matches on-chain commitment
         computed_hash = Web3.keccak(encrypted_code)
         if computed_hash != expected_hash:
@@ -371,7 +484,7 @@ class AdytumTEEWorker:
                 f"Expected {expected_hash.hex()}, got {computed_hash.hex()}. "
                 f"Possible tampering detected."
             )
-        
+
         print(f"[TEE Worker] Code hash verified: {computed_hash.hex()}")
         return encrypted_code
 
@@ -391,7 +504,7 @@ class AdytumTEEWorker:
     def validate_code(self, code: str) -> tuple[bool, str]:
         """
         Validate that the code is safe to execute in sandbox.
-        
+
         Note: nsjail provides the primary security boundary.
         This validation is defense-in-depth to catch obvious attacks early.
         """
@@ -401,7 +514,7 @@ class AdytumTEEWorker:
             "import subprocess", "from subprocess",
             "import shutil", "from shutil",
             "import pathlib", "from pathlib",
-            
+
             # Network access
             "import socket", "from socket",
             "import requests", "from requests",
@@ -409,37 +522,43 @@ class AdytumTEEWorker:
             "import http", "from http",
             "import ftplib", "from ftplib",
             "import smtplib", "from smtplib",
-            
+
             # Code execution
             "__import__", "eval(", "exec(", "compile(",
             "importlib", "builtins",
-            
+
             # File access
             "open(", "file(", "input(", "raw_input(",
-            
+
             # Pickle (can execute arbitrary code)
             "import pickle", "from pickle",
             "import cPickle", "from cPickle",
-            
+
             # Multiprocessing (escape sandbox)
             "import multiprocessing", "from multiprocessing",
             "import threading", "from threading",
-            
+
             # ctypes (escape sandbox)
             "import ctypes", "from ctypes",
         ]
-        
+
         code_lower = code.lower()
         for pattern in forbidden_patterns:
             if pattern.lower() in code_lower:
                 return False, f"Forbidden pattern detected: {pattern}"
-        
+
         # Check for attempts to access dunder attributes
-        dangerous_dunders = ["__class__", "__bases__", "__subclasses__", "__globals__", "__code__"]
+        dangerous_dunders = [
+            "__class__",
+            "__bases__",
+            "__subclasses__",
+            "__globals__",
+            "__code__",
+        ]
         for dunder in dangerous_dunders:
             if dunder in code:
                 return False, f"Dangerous dunder attribute access: {dunder}"
-        
+
         return True, ""
 
     # =========================================================================
@@ -449,7 +568,7 @@ class AdytumTEEWorker:
     def execute_sandbox(self, code: str, input_data: dict) -> tuple[Any, int]:
         """
         Execute invention code in nsjail sandbox.
-        
+
         Security measures (via nsjail):
         - Namespace isolation (PID, IPC, UTS, mount, user)
         - CPU time limit (10 seconds)
@@ -479,21 +598,21 @@ try:
 except Exception as e:
     print(json.dumps({{"success": False, "error": str(e)}}))
 '''
-        
+
         # Write script to /tmp (which is mounted in nsjail)
         with tempfile.NamedTemporaryFile(
-            mode='w', 
-            suffix='.py', 
-            delete=False, 
+            mode='w',
+            suffix='.py',
+            delete=False,
             dir='/tmp',
             prefix='adytum_'
         ) as f:
             f.write(wrapper)
             script_path = f.name
-        
+
         try:
             start_time = time.time()
-            
+
             # Execute inside nsjail sandbox
             result = subprocess.run(
                 [
@@ -504,38 +623,51 @@ except Exception as e:
                 ],
                 capture_output=True,
                 text=True,
-                timeout=SANDBOX_TIMEOUT_SECONDS + 5,  # Buffer for nsjail overhead
+                # Buffer for nsjail overhead
+                timeout=SANDBOX_TIMEOUT_SECONDS + 5,
                 cwd="/tmp",
             )
-            
+
             execution_time_ms = int((time.time() - start_time) * 1000)
-            
+
             # Check for nsjail-level failures
             if result.returncode != 0:
                 # nsjail returns non-zero for sandbox violations
-                error_msg = result.stderr.strip() if result.stderr else "Sandbox execution failed"
-                raise RuntimeError(f"Sandbox error (code {result.returncode}): {error_msg}")
-            
+                error_msg = (
+                    result.stderr.strip()
+                    if result.stderr
+                    else "Sandbox execution failed"
+                )
+                raise RuntimeError(
+                    f"Sandbox error (code {result.returncode}): {error_msg}"
+                )
+
             # Parse the output
             if not result.stdout.strip():
                 raise RuntimeError("No output from sandbox execution")
-            
+
             try:
                 output = json.loads(result.stdout)
             except json.JSONDecodeError as e:
-                raise RuntimeError(f"Invalid JSON output: {result.stdout[:200]}... Error: {e}")
-            
+                raise RuntimeError(
+                    f"Invalid JSON output: {result.stdout[:200]}... "
+                    f"Error: {e}"
+                )
+
             if not output.get("success"):
-                raise RuntimeError(output.get("error", "Unknown error in invention code"))
-            
+                raise RuntimeError(
+                    output.get("error", "Unknown error in invention code")
+                )
+
             return output["output"], execution_time_ms
-            
+
         finally:
             # Clean up the script file
             try:
                 os.unlink(script_path)
             except OSError:
-                pass  # File might already be cleaned up or in isolated namespace
+                # File might already be cleaned up or in isolated namespace
+                pass
 
     # =========================================================================
     # Cryptographic Operations
@@ -544,7 +676,7 @@ except Exception as e:
     def generate_attestation(self, prefix: str, target_hash: str) -> bytes:
         """
         Generate a cryptographic attestation signature.
-        
+
         In production, this would include dstack TEE attestation report.
         """
         message = f"ADYTUM_ATTESTATION:{prefix}:{target_hash}"
@@ -557,28 +689,34 @@ except Exception as e:
         output_bytes = json.dumps(output, sort_keys=True).encode()
         return "0x" + Web3.keccak(output_bytes).hex()
 
-    def encrypt_key_for_buyer(self, decryption_key: str, buyer_pub_key: bytes) -> bytes:
+    def encrypt_key_for_buyer(
+        self, decryption_key: str, buyer_pub_key: bytes
+    ) -> bytes:
         """
         Encrypt the decryption key using ECIES for the buyer.
-        
+
         Uses the buyer's secp256k1 public key to derive a shared secret,
         then encrypts the key with AES-GCM.
-        
+
         Format: ephemeral_pubkey (33 bytes) || nonce (12 bytes) || ciphertext
         """
         if len(buyer_pub_key) < 32:
-            raise ValueError(f"Invalid buyer public key length: {len(buyer_pub_key)}")
-        
+            raise ValueError(
+                f"Invalid buyer public key length: {len(buyer_pub_key)}"
+            )
+
         # Generate ephemeral keypair
-        ephemeral_private = ec.generate_private_key(ec.SECP256K1(), default_backend())
+        ephemeral_private = ec.generate_private_key(
+            ec.SECP256K1(), default_backend()
+        )
         ephemeral_public = ephemeral_private.public_key()
-        
+
         # Serialize ephemeral public key (compressed format)
         ephemeral_pub_bytes = ephemeral_public.public_bytes(
             encoding=serialization.Encoding.X962,
             format=serialization.PublicFormat.CompressedPoint
         )
-        
+
         # Reconstruct buyer's public key from bytes
         # Handle different public key formats
         if len(buyer_pub_key) == 32:
@@ -591,18 +729,20 @@ except Exception as e:
             # Uncompressed format (0x04 || x || y)
             buyer_pub_key_full = buyer_pub_key
         else:
-            raise ValueError(f"Unexpected public key length: {len(buyer_pub_key)}")
-        
+            raise ValueError(
+                f"Unexpected public key length: {len(buyer_pub_key)}"
+            )
+
         try:
             buyer_public = ec.EllipticCurvePublicKey.from_encoded_point(
                 ec.SECP256K1(), buyer_pub_key_full
             )
         except Exception as e:
             raise ValueError(f"Failed to parse buyer public key: {e}")
-        
+
         # ECDH key exchange
         shared_secret = ephemeral_private.exchange(ec.ECDH(), buyer_public)
-        
+
         # Derive AES key using HKDF
         derived_key = HKDF(
             algorithm=hashes.SHA256(),
@@ -611,12 +751,12 @@ except Exception as e:
             info=b"adytum-key-encryption",
             backend=default_backend()
         ).derive(shared_secret)
-        
+
         # Encrypt with AES-GCM
         nonce = os.urandom(12)
         aesgcm = AESGCM(derived_key)
         ciphertext = aesgcm.encrypt(nonce, decryption_key.encode(), None)
-        
+
         # Combine: ephemeral_pubkey || nonce || ciphertext
         return ephemeral_pub_bytes + nonce + ciphertext
 
@@ -624,10 +764,12 @@ except Exception as e:
     # Main Execution Flow
     # =========================================================================
 
-    def execute_code(self, request: ExecutionRequestDomain) -> ExecutionResultDomain:
+    def execute_code(
+        self, request: ExecutionRequestDomain
+    ) -> ExecutionResultDomain:
         """
         Execute an invention request end-to-end.
-        
+
         1. Fetch encrypted code from IPFS
         2. Verify code hash matches on-chain commitment
         3. Decrypt code
@@ -638,24 +780,28 @@ except Exception as e:
         try:
             # 1. Fetch and verify encrypted code
             encrypted_code = self.fetch_invention_code(request.invention_id)
-            
+
             # 2. Decrypt code
             code = self.decrypt_code(encrypted_code, request.decryption_key)
-            
+
             # 3. Validate code safety (defense-in-depth, nsjail is primary)
             is_valid, error_msg = self.validate_code(code)
             if not is_valid:
                 raise RuntimeError(f"Code validation failed: {error_msg}")
-            
+
             # 4. Execute in nsjail sandbox
-            output, execution_time_ms = self.execute_sandbox(code, request.input_data)
-            
+            output, execution_time_ms = self.execute_sandbox(
+                code, request.input_data
+            )
+
             # 5. Compute result hash and attestation
             result_hash = self.compute_result_hash(output)
-            attestation = self.generate_attestation(request.execution_id, result_hash)
-            
+            attestation = self.generate_attestation(
+                request.execution_id, result_hash
+            )
+
             print(f"[TEE Worker] Execution successful: {request.execution_id}")
-            
+
             return ExecutionResultDomain(
                 execution_id=request.execution_id,
                 invention_id=request.invention_id,
@@ -665,10 +811,10 @@ except Exception as e:
                 attestation=attestation,
                 success=True,
             )
-            
+
         except Exception as e:
             print(f"[TEE Worker] Execution failed: {e}")
-            
+
             return ExecutionResultDomain(
                 execution_id=request.execution_id,
                 invention_id=request.invention_id,
@@ -683,7 +829,7 @@ except Exception as e:
     def submit_execution_result(self, result: ExecutionResultDomain):
         """Submit execution result to the AdytumMarketplace contract."""
         exec_id_bytes = self._to_bytes32(result.execution_id)
-        
+
         if result.success:
             res_hash_bytes = self._to_bytes32(result.result_hash)
             tx = self.contract.functions.submitExecutionResult(
@@ -693,7 +839,9 @@ except Exception as e:
                 result.execution_time_ms,
             ).build_transaction({
                 "from": self.account.address,
-                "nonce": self.w3.eth.get_transaction_count(self.account.address),
+                "nonce": self.w3.eth.get_transaction_count(
+                    self.account.address
+                ),
                 "gas": 200000,
                 "gasPrice": self.w3.eth.gas_price,
             })
@@ -703,98 +851,136 @@ except Exception as e:
                 result.error or "Unknown error",
             ).build_transaction({
                 "from": self.account.address,
-                "nonce": self.w3.eth.get_transaction_count(self.account.address),
+                "nonce": self.w3.eth.get_transaction_count(
+                    self.account.address
+                ),
                 "gas": 150000,
                 "gasPrice": self.w3.eth.gas_price,
             })
-            
+
         signed_tx = self.account.sign_transaction(tx)
         tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
         receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
-        
-        print(f"[TEE Worker] Execution result submitted. TX: {receipt.transactionHash.hex()}")
+
+        print(
+            f"[TEE Worker] Execution result submitted. TX: "
+            f"{receipt.transactionHash.hex()}"
+        )
         return receipt
 
     # =========================================================================
     # Key Release (Nash Winner)
     # =========================================================================
 
-    def release_key(self, invention_id: str, buyer: str, key_store: "KeyStore") -> dict:
+    def release_key(
+        self, invention_id: str, buyer: str, key_store: "KeyStore"
+    ) -> dict:
         """
         Securely release decryption key to Nash winner.
-        
+
         Authorization checks:
         1. Verify invention exists and is Nash model
         2. Verify Nash phase is SETTLED
         3. Verify buyer is the highestBidder (winner)
         4. Encrypt key with buyer's public key
         5. Submit on-chain
-        
+
         Implements NDAi §4.2 secure key delivery.
+
+        Note: Uses settlement_account for key release operations.
         """
         inv_bytes = self._to_bytes32(invention_id)
-        
+
         # 1. Verify invention exists and is Nash model
         invention = self.get_invention(invention_id)
         if invention.model != MonetizationModel.NASH_NEGOTIATION:
-            raise ValueError(f"Invention {invention_id} is not a Nash negotiation")
-        
+            raise ValueError(
+                f"Invention {invention_id} is not a Nash negotiation"
+            )
+
         # 2. Verify Nash is settled
         nash_config = self.get_nash_config(invention_id)
-        
+
         if nash_config.phase != NashPhase.SETTLED:
-            phase_names = {0: "OPEN", 1: "REVEAL", 2: "SETTLED", 3: "FAILED", 4: "EXPIRED"}
+            phase_names = {
+                0: "OPEN",
+                1: "REVEAL",
+                2: "SETTLED",
+                3: "FAILED",
+                4: "EXPIRED",
+            }
+            phase = nash_config.phase
+            phase_label = phase_names.get(phase, phase)
             raise ValueError(
-                f"Cannot release key: Nash phase is {phase_names.get(nash_config.phase, nash_config.phase)}, "
+                f"Cannot release key: Nash phase is {phase_label}, "
                 f"expected SETTLED"
             )
-        
+
         # 3. Verify buyer is the winner
         if nash_config.highest_bidder.lower() != buyer.lower():
             raise ValueError(
                 f"Buyer {buyer} is not the winner. "
                 f"Winner is {nash_config.highest_bidder}"
             )
-        
+
         # 4. Get decryption key from TEE storage
         decryption_key = key_store.get_key(invention_id)
         if not decryption_key:
-            raise ValueError(f"Decryption key not found in TEE storage for {invention_id}")
-        
+            raise ValueError(
+                f"Decryption key not found in TEE storage for {invention_id}"
+            )
+
         # 5. Fetch buyer's public key from contract
-        buyer_pub_key = self.contract.functions.getBuyerPubKey(inv_bytes, buyer).call()
-        
+        buyer_pub_key = self.contract.functions.getBuyerPubKey(
+            inv_bytes, buyer
+        ).call()
+
         if not buyer_pub_key or len(buyer_pub_key) == 0:
-            raise ValueError(f"Buyer public key not found on-chain for {buyer}")
-        
-        print(f"[TEE Worker] Encrypting key for buyer {buyer} with pubkey length {len(buyer_pub_key)}")
-        
-        # 6. Encrypt key with ECIES
-        encrypted_key_bytes = self.encrypt_key_for_buyer(decryption_key, buyer_pub_key)
-        
-        # 7. Generate attestation
-        attestation = self.generate_attestation(
-            f"KEY_RELEASE:{invention_id}",
-            buyer.lower()
+            raise ValueError(
+                f"Buyer public key not found on-chain for {buyer}"
+            )
+
+        print(
+            f"[TEE Worker] Encrypting key for buyer {buyer} "
+            f"with pubkey length {len(buyer_pub_key)}"
         )
-        
-        # 8. Submit to contract
+
+        # 6. Encrypt key with ECIES
+        encrypted_key_bytes = self.encrypt_key_for_buyer(
+            decryption_key, buyer_pub_key
+        )
+
+        # 7. Generate attestation (using settlement account)
+        message = (
+            f"ADYTUM_ATTESTATION:KEY_RELEASE:{invention_id}:"
+            f"{buyer.lower()}"
+        )
+        message_hash = encode_defunct(text=message)
+        signed = self.settlement_account.sign_message(message_hash)
+        attestation = signed.signature
+
+        # 8. Submit to contract (using settlement account)
         tx = self.contract.functions.releaseEncryptedKey(
             inv_bytes,
             encrypted_key_bytes,
             attestation
         ).build_transaction({
-            "from": self.account.address,
-            "nonce": self.w3.eth.get_transaction_count(self.account.address),
+            "from": self.settlement_account.address,
+            "nonce": self.w3.eth.get_transaction_count(
+                self.settlement_account.address
+            ),
             "gas": 250000,
             "gasPrice": self.w3.eth.gas_price,
         })
 
-        signed_tx = self.account.sign_transaction(tx)
+        signed_tx = self.settlement_account.sign_transaction(tx)
         tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
         receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
-        
-        print(f"[TEE Worker] Key release submitted. TX: {receipt.transactionHash.hex()}")
+
+        print(
+            f"[TEE Worker] Key release submitted. TX: "
+            f"{receipt.transactionHash.hex()}"
+        )
 
         return {
             "success": True,
@@ -820,48 +1006,48 @@ except Exception as e:
 class KeyStore:
     """
     Secure key storage within the TEE.
-    
+
     In production (dstack), this uses the TEE's sealed storage.
     Keys are encrypted at rest and only accessible within the enclave.
     """
-    
+
     def __init__(self, storage_path: str | None = None):
         self.storage_path = storage_path or KEY_STORE_PATH
         os.makedirs(self.storage_path, exist_ok=True)
         print(f"[KeyStore] Initialized at {self.storage_path}")
-        
+
     def store_key(self, invention_id: str, decryption_key: str) -> None:
         """Store a decryption key for an invention."""
         # Normalize invention_id
         clean_id = invention_id.replace("0x", "").lower()
         key_path = os.path.join(self.storage_path, f"{clean_id}.key")
-        
+
         with open(key_path, "w") as f:
             f.write(decryption_key)
-        
+
         print(f"[KeyStore] Stored key for invention {clean_id[:16]}...")
-            
+
     def get_key(self, invention_id: str) -> str | None:
         """Retrieve a decryption key for an invention."""
         clean_id = invention_id.replace("0x", "").lower()
         key_path = os.path.join(self.storage_path, f"{clean_id}.key")
-        
+
         if os.path.exists(key_path):
             with open(key_path, "r") as f:
                 return f.read().strip()
         return None
-    
+
     def delete_key(self, invention_id: str) -> bool:
         """Delete a decryption key (e.g., after Nash settlement)."""
         clean_id = invention_id.replace("0x", "").lower()
         key_path = os.path.join(self.storage_path, f"{clean_id}.key")
-        
+
         if os.path.exists(key_path):
             os.remove(key_path)
             print(f"[KeyStore] Deleted key for invention {clean_id[:16]}...")
             return True
         return False
-    
+
     def has_key(self, invention_id: str) -> bool:
         """Check if a key exists for an invention."""
         clean_id = invention_id.replace("0x", "").lower()
