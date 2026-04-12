@@ -147,10 +147,27 @@ class ReleaseKeyResponse(BaseModel):
 
 
 class StoreKeyRequest(BaseModel):
-    """Request to store decryption key for a new invention."""
+    """
+    Request to store decryption key for a new invention.
+    
+    The seller must sign a message containing the invention_id
+    to prove they are the legitimate owner of the invention.
+    
+    Message format (what the seller signs):
+        "ADYTUM_STORE_KEY:{invention_id}"
+    
+    Example flow:
+        1. Seller creates invention on-chain (gets invention_id)
+        2. Seller signs: "ADYTUM_STORE_KEY:0xabc123...:base64key..."
+        3. Seller calls /store-key with invention_id, signature
+        4. TEE recovers signer address from signature
+        5. TEE calls getInvention(invention_id) to get on-chain seller
+        6. TEE compares recovered address == on-chain seller
+        7. If match, stores key; if not, rejects
+    """
     invention_id: str = Field(..., description="Invention ID (bytes32 hex)")
-    decryption_key: str = Field(..., description="Fernet decryption key")
-    seller: str = Field(..., description="Seller address (for verification)")
+    decryption_key: str = Field(..., description="Fernet decryption key (base64, 44 chars)")
+    signature: str = Field(..., description="EIP-191 signature of 'ADYTUM_STORE_KEY:{invention_id}'")
     
     @field_validator("invention_id")
     @classmethod
@@ -160,12 +177,14 @@ class StoreKeyRequest(BaseModel):
             raise ValueError("Must be a valid bytes32 hex string")
         return "0x" + clean.lower()
     
-    @field_validator("seller")
+    @field_validator("signature")
     @classmethod
-    def validate_address(cls, v: str) -> str:
-        if not re.match(r"^0x[a-fA-F0-9]{40}$", v):
-            raise ValueError("Must be a valid Ethereum address")
-        return v.lower()
+    def validate_signature(cls, v: str) -> str:
+        # Signature should be 65 bytes (130 hex chars) with 0x prefix
+        clean = v.replace("0x", "")
+        if not re.match(r"^[a-fA-F0-9]{130}$", clean):
+            raise ValueError("Signature must be 65 bytes (130 hex characters)")
+        return "0x" + clean.lower()
     
     @field_validator("decryption_key")
     @classmethod
@@ -410,21 +429,25 @@ async def store_key(request: StoreKeyRequest):
     """
     Store decryption key for a new invention.
     
+    Security flow:
+    1. Recover signer address from the provided signature
+    2. Query smart contract for the invention's on-chain seller
+    3. Compare recovered address == on-chain seller address
+    4. If match, store the key in TEE-sealed storage
+    5. If mismatch, reject with 403 Forbidden
+    
     Called when a seller lists an invention:
     1. Frontend encrypts code with Fernet key
-    2. Frontend uploads encrypted code to IPFS
-    3. Frontend calls this endpoint to store key in TEE
-    4. Frontend calls contract to list invention
+    2. Frontend uploads encrypted code to IPFS  
+    3. Frontend calls contract to list invention (gets invention_id)
+    4. Frontend signs message: "ADYTUM_STORE_KEY:{invention_id}"
+    5. Frontend calls this endpoint with invention_id, signature
+    6. TEE verifies ownership and stores key
     
     Security:
-    - Key is stored in TEE-sealed storage
-    - Only accessible within this enclave
-    - Never exposed outside the TEE
-    
-    TODO (production):
-    - Verify seller owns this invention on-chain
-    - Verify encryption key hash matches contract
-    - Rate limiting per seller
+    - Signature proves the caller controls the seller's private key
+    - On-chain verification ensures the invention actually belongs to this seller
+    - Key is stored in TEE-sealed storage, never exposed outside enclave
     """
     if worker is None or key_store is None:
         raise HTTPException(
@@ -433,24 +456,82 @@ async def store_key(request: StoreKeyRequest):
         )
     
     try:
-        # In production: Verify seller owns this invention
-        # invention = worker.get_invention(request.invention_id)
-        # if invention.seller.lower() != request.seller.lower():
-        #     raise ValueError("Seller does not own this invention")
+        # Import here to avoid circular imports
+        from eth_account.messages import encode_defunct
+        from eth_account import Account
         
-        # Check if key already exists
+        # =================================================================
+        # Step 1: Recover signer address from signature
+        # =================================================================
+        # The seller must have signed: "ADYTUM_STORE_KEY:{invention_id}"
+        message_text = f"ADYTUM_STORE_KEY:{request.invention_id}"
+        message = encode_defunct(text=message_text)
+        
+        try:
+            recovered_address = Account.recover_message(message, signature=request.signature)
+            recovered_address = recovered_address.lower()
+            print(f"[Server] Recovered signer address: {recovered_address}")
+        except Exception as e:
+            print(f"[Server] Signature recovery failed: {e}")
+            return StoreKeyResponse(
+                success=False,
+                invention_id=request.invention_id,
+                error=f"Invalid signature: {e}"
+            )
+        
+        # =================================================================
+        # Step 2: Query smart contract for on-chain seller
+        # =================================================================
+        try:
+            invention = worker.get_invention(request.invention_id)
+            onchain_seller = invention.seller.lower()
+            print(f"[Server] On-chain seller: {onchain_seller}")
+        except Exception as e:
+            print(f"[Server] Failed to fetch invention from contract: {e}")
+            return StoreKeyResponse(
+                success=False,
+                invention_id=request.invention_id,
+                error=f"Failed to verify invention on-chain: {e}"
+            )
+        
+        # =================================================================
+        # Step 3: Compare recovered address with on-chain seller
+        # =================================================================
+        if recovered_address != onchain_seller:
+            print(f"[Server] REJECTED: Signer {recovered_address} != Seller {onchain_seller}")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Signature does not match invention seller. "
+                       f"Recovered: {recovered_address}, Expected: {onchain_seller}"
+            )
+        
+        print(f"[Server] ✓ Ownership verified: {recovered_address} == {onchain_seller}")
+        
+        # =================================================================
+        # Step 4: Check if key already exists
+        # =================================================================
         if key_store.has_key(request.invention_id):
-            raise ValueError(f"Key already stored for invention {request.invention_id}")
+            return StoreKeyResponse(
+                success=False,
+                invention_id=request.invention_id,
+                error=f"Key already stored for invention {request.invention_id}"
+            )
         
-        # Store the key
-        key_store.store_key(request.invention_id, request.decryption_key)
+        # =================================================================
+        # Step 5: Store the key in TEE-sealed storage
+        # =================================================================
+        key_store.store_key(request.invention_id)
         
-        print(f"[Server] Stored key for invention {request.invention_id[:18]}...")
+        print(f"[Server] ✓ Stored key for invention {request.invention_id[:18]}... (seller: {onchain_seller[:10]}...)")
         
         return StoreKeyResponse(
             success=True,
             invention_id=request.invention_id,
         )
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions (like 403)
+        raise
         
     except ValueError as e:
         return StoreKeyResponse(
