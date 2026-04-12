@@ -40,15 +40,15 @@ key_store: KeyStore | None = None
 async def lifespan(app: FastAPI):
     """Initialize worker and key store on startup."""
     global worker, key_store
-    
+
     print("[Server] Initializing TEE Worker...")
     worker = AdytumTEEWorker()
     key_store = KeyStore()
-    
+
     print(f"[Server] TEE Worker ready. Oracle: {worker.account.address}")
-    
+
     yield
-    
+
     print("[Server] Shutting down TEE Worker...")
 
 
@@ -59,8 +59,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Adytum TEE Worker",
     description=(
-        "TEE enclave worker for executing invention code and releasing keys securely. "
-        "Implements the TEE-resident agent from NDAi paper (Stephenson et al., 2025)."
+        "TEE enclave worker for executing invention code and "
+        "releasing keys securely. "
+        "Implements the TEE-resident agent from NDAI paper "
+        "(Stephenson et al., 2025)."
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -82,11 +84,14 @@ app.add_middleware(
 
 class ExecuteRequest(BaseModel):
     """Request to execute invention code."""
-    execution_id: str = Field(..., description="Unique execution ID (bytes32 hex)")
+    execution_id: str = Field(
+        ...,
+        description="Unique execution ID (bytes32 hex)",
+    )
     invention_id: str = Field(..., description="Invention ID (bytes32 hex)")
     buyer: str = Field(..., description="Buyer address (0x...)")
     input_data: dict = Field(..., description="Input data for the invention")
-    
+
     @field_validator("execution_id", "invention_id")
     @classmethod
     def validate_bytes32(cls, v: str) -> str:
@@ -94,7 +99,7 @@ class ExecuteRequest(BaseModel):
         if not re.match(r"^[a-fA-F0-9]{64}$", clean):
             raise ValueError("Must be a valid bytes32 hex string")
         return "0x" + clean.lower()
-    
+
     @field_validator("buyer")
     @classmethod
     def validate_address(cls, v: str) -> str:
@@ -118,7 +123,7 @@ class ReleaseKeyRequest(BaseModel):
     """Request to release decryption key to Nash winner."""
     invention_id: str = Field(..., description="Invention ID (bytes32 hex)")
     buyer: str = Field(..., description="Buyer address (must be Nash winner)")
-    
+
     @field_validator("invention_id")
     @classmethod
     def validate_bytes32(cls, v: str) -> str:
@@ -126,7 +131,7 @@ class ReleaseKeyRequest(BaseModel):
         if not re.match(r"^[a-fA-F0-9]{64}$", clean):
             raise ValueError("Must be a valid bytes32 hex string")
         return "0x" + clean.lower()
-    
+
     @field_validator("buyer")
     @classmethod
     def validate_address(cls, v: str) -> str:
@@ -149,13 +154,13 @@ class ReleaseKeyResponse(BaseModel):
 class StoreKeyRequest(BaseModel):
     """
     Request to store decryption key for a new invention.
-    
+
     The seller must sign a message containing the invention_id
     to prove they are the legitimate owner of the invention.
-    
+
     Message format (what the seller signs):
         "ADYTUM_STORE_KEY:{invention_id}"
-    
+
     Example flow:
         1. Seller creates invention on-chain (gets invention_id)
         2. Seller signs: "ADYTUM_STORE_KEY:0xabc123...:base64key..."
@@ -166,9 +171,17 @@ class StoreKeyRequest(BaseModel):
         7. If match, stores key; if not, rejects
     """
     invention_id: str = Field(..., description="Invention ID (bytes32 hex)")
-    decryption_key: str = Field(..., description="Fernet decryption key (base64, 44 chars)")
-    signature: str = Field(..., description="EIP-191 signature of 'ADYTUM_STORE_KEY:{invention_id}'")
-    
+    decryption_key: str = Field(
+        ...,
+        description="Fernet decryption key (base64, 44 chars)",
+    )
+    signature: str = Field(
+        ...,
+        description=(
+            "EIP-191 signature of 'ADYTUM_STORE_KEY:{invention_id}'"
+        ),
+    )
+
     @field_validator("invention_id")
     @classmethod
     def validate_bytes32(cls, v: str) -> str:
@@ -176,7 +189,7 @@ class StoreKeyRequest(BaseModel):
         if not re.match(r"^[a-fA-F0-9]{64}$", clean):
             raise ValueError("Must be a valid bytes32 hex string")
         return "0x" + clean.lower()
-    
+
     @field_validator("signature")
     @classmethod
     def validate_signature(cls, v: str) -> str:
@@ -185,13 +198,15 @@ class StoreKeyRequest(BaseModel):
         if not re.match(r"^[a-fA-F0-9]{130}$", clean):
             raise ValueError("Signature must be 65 bytes (130 hex characters)")
         return "0x" + clean.lower()
-    
+
     @field_validator("decryption_key")
     @classmethod
     def validate_fernet_key(cls, v: str) -> str:
         # Fernet keys are 44 characters base64
         if len(v) != 44:
-            raise ValueError("Decryption key must be a valid Fernet key (44 chars)")
+            raise ValueError(
+                "Decryption key must be a valid Fernet key (44 chars)"
+            )
         return v
 
 
@@ -228,7 +243,7 @@ class AttestationResponse(BaseModel):
 async def health():
     """
     Health check endpoint.
-    
+
     Returns the oracle address and enclave status.
     Used by load balancers and monitoring.
     """
@@ -237,7 +252,7 @@ async def health():
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Worker not initialized"
         )
-    
+
     return HealthResponse(
         status="healthy",
         oracle_address=worker.account.address,
@@ -252,7 +267,7 @@ async def health():
 async def get_attestation():
     """
     Get TEE attestation report.
-    
+
     In production (dstack), this returns the remote attestation
     proving code is running inside a genuine TEE enclave.
     """
@@ -261,10 +276,13 @@ async def get_attestation():
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Worker not initialized"
         )
-    
+
     # In production: Include dstack remote attestation
-    attestation = worker.generate_attestation("HEALTH_CHECK", worker.account.address)
-    
+    attestation = worker.generate_attestation(
+        "HEALTH_CHECK",
+        worker.account.address,
+    )
+
     return AttestationResponse(
         enclave_type="dstack",
         oracle_address=worker.account.address,
@@ -281,7 +299,7 @@ async def get_attestation():
 async def execute_invention(request: ExecuteRequest):
     """
     Execute invention code in the TEE nsjail sandbox.
-    
+
     Flow:
     1. Fetch decryption key from local TEE storage
     2. Fetch encrypted code from IPFS (via contract metadata)
@@ -291,7 +309,7 @@ async def execute_invention(request: ExecuteRequest):
     6. Execute in nsjail sandbox with resource limits
     7. Submit result hash and attestation to contract
     8. Return result to caller
-    
+
     Security:
     - Code never leaves the TEE
     - nsjail provides namespace isolation
@@ -304,13 +322,15 @@ async def execute_invention(request: ExecuteRequest):
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Worker not initialized"
         )
-    
+
     try:
         # 1. Get decryption key from TEE storage
         decryption_key = key_store.get_key(request.invention_id)
         if not decryption_key:
-            raise ValueError(f"No decryption key found for invention {request.invention_id}")
-        
+            raise ValueError(
+                f"No decryption key found for invention {request.invention_id}"
+            )
+
         # 2. Build execution request
         request_domain = ExecutionRequestDomain(
             execution_id=request.execution_id,
@@ -319,19 +339,22 @@ async def execute_invention(request: ExecuteRequest):
             input_data=request.input_data,
             decryption_key=decryption_key,
         )
-        
+
         # 3. Execute in nsjail sandbox
         result = worker.execute_code(request_domain)
-        
+
         # 4. Submit to contract
         try:
             receipt = worker.submit_execution_result(result)
-            print(f"[Server] Execution result submitted. TX: {receipt.transactionHash.hex()}")
+            print(
+                f"[Server] Execution result submitted. TX: "
+                f"{receipt.transactionHash.hex()}"
+            )
         except Exception as e:
             print(f"[Server] Warning: Failed to submit to contract: {e}")
             # Still return result even if contract submission fails
             # (allows retry logic on the caller side)
-        
+
         # 5. Build response
         if result.success:
             return ExecuteResponse(
@@ -340,7 +363,11 @@ async def execute_invention(request: ExecuteRequest):
                 output=result.output,
                 result_hash=result.result_hash,
                 execution_time_ms=result.execution_time_ms,
-                attestation="0x" + result.attestation.hex() if result.attestation else None,
+                attestation=(
+                    "0x" + result.attestation.hex()
+                    if result.attestation
+                    else None
+                ),
             )
         else:
             return ExecuteResponse(
@@ -348,7 +375,7 @@ async def execute_invention(request: ExecuteRequest):
                 execution_id=result.execution_id,
                 error=result.error,
             )
-            
+
     except Exception as e:
         print(f"[Server] Execution error: {e}")
         return ExecuteResponse(
@@ -366,19 +393,19 @@ async def execute_invention(request: ExecuteRequest):
 async def release_key(request: ReleaseKeyRequest):
     """
     Release decryption key to Nash winner.
-    
+
     Authorization checks (performed by worker):
     1. Invention must be Nash negotiation model
     2. Nash phase must be SETTLED
     3. Buyer must be the highestBidder (winner)
-    
+
     Flow:
     1. Verify authorization on-chain
     2. Fetch buyer's public key from contract
     3. Encrypt decryption key with ECIES
     4. Submit encrypted key and attestation on-chain
     5. Return encrypted key to caller
-    
+
     Implements NDAi §4.2 secure key delivery.
     """
     if worker is None or key_store is None:
@@ -386,7 +413,7 @@ async def release_key(request: ReleaseKeyRequest):
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Worker not initialized"
         )
-    
+
     try:
         # Worker performs all authorization checks internally
         result = worker.release_key(
@@ -394,7 +421,7 @@ async def release_key(request: ReleaseKeyRequest):
             request.buyer,
             key_store
         )
-        
+
         return ReleaseKeyResponse(
             success=True,
             invention_id=request.invention_id,
@@ -403,7 +430,7 @@ async def release_key(request: ReleaseKeyRequest):
             attestation=result["attestation"],
             tx_hash=result.get("tx_hash"),
         )
-        
+
     except ValueError as e:
         # Authorization or validation error
         print(f"[Server] Key release denied: {e}")
@@ -413,7 +440,7 @@ async def release_key(request: ReleaseKeyRequest):
             buyer=request.buyer,
             error=str(e),
         )
-        
+
     except Exception as e:
         print(f"[Server] Key release error: {e}")
         return ReleaseKeyResponse(
@@ -428,14 +455,14 @@ async def release_key(request: ReleaseKeyRequest):
 async def store_key(request: StoreKeyRequest):
     """
     Store decryption key for a new invention.
-    
+
     Security flow:
     1. Recover signer address from the provided signature
     2. Query smart contract for the invention's on-chain seller
     3. Compare recovered address == on-chain seller address
     4. If match, store the key in TEE-sealed storage
     5. If mismatch, reject with 403 Forbidden
-    
+
     Called when a seller lists an invention:
     1. Frontend encrypts code with Fernet key
     2. Frontend uploads encrypted code to IPFS  
@@ -443,10 +470,11 @@ async def store_key(request: StoreKeyRequest):
     4. Frontend signs message: "ADYTUM_STORE_KEY:{invention_id}"
     5. Frontend calls this endpoint with invention_id, signature
     6. TEE verifies ownership and stores key
-    
+
     Security:
     - Signature proves the caller controls the seller's private key
-    - On-chain verification ensures the invention actually belongs to this seller
+    - On-chain verification ensures the invention actually belongs to this
+      seller
     - Key is stored in TEE-sealed storage, never exposed outside enclave
     """
     if worker is None or key_store is None:
@@ -454,21 +482,23 @@ async def store_key(request: StoreKeyRequest):
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Worker not initialized"
         )
-    
+
     try:
         # Import here to avoid circular imports
         from eth_account.messages import encode_defunct
         from eth_account import Account
-        
+
         # =================================================================
         # Step 1: Recover signer address from signature
         # =================================================================
         # The seller must have signed: "ADYTUM_STORE_KEY:{invention_id}"
         message_text = f"ADYTUM_STORE_KEY:{request.invention_id}"
         message = encode_defunct(text=message_text)
-        
+
         try:
-            recovered_address = Account.recover_message(message, signature=request.signature)
+            recovered_address = Account.recover_message(
+                message, signature=request.signature
+            )
             recovered_address = recovered_address.lower()
             print(f"[Server] Recovered signer address: {recovered_address}")
         except Exception as e:
@@ -478,7 +508,7 @@ async def store_key(request: StoreKeyRequest):
                 invention_id=request.invention_id,
                 error=f"Invalid signature: {e}"
             )
-        
+
         # =================================================================
         # Step 2: Query smart contract for on-chain seller
         # =================================================================
@@ -493,20 +523,29 @@ async def store_key(request: StoreKeyRequest):
                 invention_id=request.invention_id,
                 error=f"Failed to verify invention on-chain: {e}"
             )
-        
+
         # =================================================================
         # Step 3: Compare recovered address with on-chain seller
         # =================================================================
         if recovered_address != onchain_seller:
-            print(f"[Server] REJECTED: Signer {recovered_address} != Seller {onchain_seller}")
+            print(
+                f"[Server] REJECTED: Signer {recovered_address} "
+                f"!= Seller {onchain_seller}"
+            )
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Signature does not match invention seller. "
-                       f"Recovered: {recovered_address}, Expected: {onchain_seller}"
+                detail=(
+                    f"Signature does not match invention seller. "
+                    f"Recovered: {recovered_address}, "
+                    f"Expected: {onchain_seller}"
+                )
             )
-        
-        print(f"[Server] ✓ Ownership verified: {recovered_address} == {onchain_seller}")
-        
+
+        print(
+            f"[Server] ✓ Ownership verified: {recovered_address} "
+            f"== {onchain_seller}"
+        )
+
         # =================================================================
         # Step 4: Check if key already exists
         # =================================================================
@@ -514,32 +553,38 @@ async def store_key(request: StoreKeyRequest):
             return StoreKeyResponse(
                 success=False,
                 invention_id=request.invention_id,
-                error=f"Key already stored for invention {request.invention_id}"
+                error=(
+                    f"Key already stored for invention {request.invention_id}"
+                )
             )
-        
+
         # =================================================================
         # Step 5: Store the key in TEE-sealed storage
         # =================================================================
         key_store.store_key(request.invention_id)
-        
-        print(f"[Server] ✓ Stored key for invention {request.invention_id[:18]}... (seller: {onchain_seller[:10]}...)")
-        
+
+        print(
+            f"[Server] ✓ Stored key for invention "
+            f"{request.invention_id[:18]}... "
+            f"(seller: {onchain_seller[:10]}...)"
+        )
+
         return StoreKeyResponse(
             success=True,
             invention_id=request.invention_id,
         )
-        
+
     except HTTPException:
         # Re-raise HTTP exceptions (like 403)
         raise
-        
+
     except ValueError as e:
         return StoreKeyResponse(
             success=False,
             invention_id=request.invention_id,
             error=str(e),
         )
-        
+
     except Exception as e:
         print(f"[Server] Store key error: {e}")
         raise HTTPException(
@@ -552,7 +597,7 @@ async def store_key(request: StoreKeyRequest):
 async def check_key_exists(invention_id: str):
     """
     Check if a decryption key exists for an invention.
-    
+
     Used by frontend to verify key was stored before listing.
     Does NOT return the key itself.
     """
@@ -561,7 +606,7 @@ async def check_key_exists(invention_id: str):
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Key store not initialized"
         )
-    
+
     # Validate invention_id format
     clean = invention_id.replace("0x", "")
     if not re.match(r"^[a-fA-F0-9]{64}$", clean):
@@ -569,9 +614,9 @@ async def check_key_exists(invention_id: str):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid invention ID format"
         )
-    
+
     exists = key_store.has_key(invention_id)
-    
+
     return {
         "invention_id": "0x" + clean.lower(),
         "key_exists": exists,
@@ -582,7 +627,7 @@ async def check_key_exists(invention_id: str):
 async def delete_key(invention_id: str, seller: str):
     """
     Delete a decryption key (e.g., when deactivating an invention).
-    
+
     TODO (production):
     - Verify seller owns this invention on-chain
     - Verify invention is deactivated
@@ -592,7 +637,7 @@ async def delete_key(invention_id: str, seller: str):
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Key store not initialized"
         )
-    
+
     # Validate invention_id format
     clean = invention_id.replace("0x", "")
     if not re.match(r"^[a-fA-F0-9]{64}$", clean):
@@ -600,21 +645,21 @@ async def delete_key(invention_id: str, seller: str):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid invention ID format"
         )
-    
+
     # Validate seller address
     if not re.match(r"^0x[a-fA-F0-9]{40}$", seller):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid seller address format"
         )
-    
+
     # In production: Verify seller owns this invention on-chain
     # invention = worker.get_invention(invention_id)
     # if invention.seller.lower() != seller.lower():
     #     raise HTTPException(status_code=403, detail="Not authorized")
-    
+
     deleted = key_store.delete_key(invention_id)
-    
+
     return {
         "invention_id": "0x" + clean.lower(),
         "deleted": deleted,
@@ -627,12 +672,12 @@ async def delete_key(invention_id: str, seller: str):
 
 if __name__ == "__main__":
     import uvicorn
-    
+
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8001"))
-    
+
     print(f"[Server] Starting Adytum TEE Worker on {host}:{port}")
-    
+
     uvicorn.run(
         app,
         host=host,
