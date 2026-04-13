@@ -12,7 +12,7 @@
 #   phala deploy --commit --token <token>
 #
 # Local testing (without dstack):
-#   docker-compose up --build
+#   docker-compose up
 #   # Worker will use ORACLE_PRIVATE_KEY env var as fallback
 
 services:
@@ -22,9 +22,7 @@ services:
   # Derives deterministic Ethereum keys from the dstack KMS.
   # Runs once on startup, writes keys to shared volume, then exits.
   identity:
-    build:
-      context: .
-      dockerfile: identity/Dockerfile
+    image: ivanmolto/adytum-tee-identity:latest
     volumes:
       # CRITICAL: Required for dstack-sdk to communicate with KMS
       - /var/run/dstack.sock:/var/run/dstack.sock
@@ -45,10 +43,7 @@ services:
   # - Key storage and release for Nash negotiations
   # - Contract interactions (submitExecutionResult, releaseKey, etc.)
   worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: adytum-tee-worker:latest
+    image: ivanmolto/adytum-tee-worker:latest
     # Wait for identity service to complete successfully
     depends_on:
       identity:
