@@ -40,7 +40,10 @@ import requests
 
 RPC_URL = os.getenv("RPC_URL", "https://sepolia.base.org")
 CONTRACT_ADDRESS = os.getenv("CONTRACT_ADDRESS")
-IPFS_GATEWAY = os.getenv("IPFS_GATEWAY", "https://ipfs.io/ipfs/")
+IPFS_GATEWAY = os.getenv(
+    "IPFS_GATEWAY",
+    "https://olive-useful-fly-746.mypinata.cloud/",
+)
 KEY_STORE_PATH = os.getenv("KEY_STORE_PATH", "/tee/keys")
 NSJAIL_CONFIG_PATH = os.getenv("NSJAIL_CONFIG_PATH", "/app/nsjail.cfg")
 
